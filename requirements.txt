@@ -1,5 +1,5 @@
-# Image Tampering Detection & Restoration - Python Dependencies
-# =============================================================
+# ImageGuard - Image Tampering Detection & Restoration
+# ====================================================
 
 # Web Framework
 fastapi==0.104.1
@@ -12,8 +12,8 @@ opencv-python-headless==4.8.1.78
 numpy==1.26.2
 
 # Deep Learning (PyTorch)
-# Install with CUDA support: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# CPU-only: pip install torch torchvision
+# For GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# For CPU: pip install torch torchvision
 torch==2.1.1
 torchvision==0.16.1
 
@@ -22,11 +22,11 @@ scipy==1.11.4
 scikit-learn==1.3.2
 scikit-image==0.22.0
 
+# Optional: For timm (SegFormer backbone in TruFor)
+timm==0.9.12
+
 # Report generation
 reportlab==4.0.8
-
-# Database
-# (SQLite is built into Python - no additional package needed)
 
 # Utilities
 python-dotenv==1.0.0
@@ -36,6 +36,3 @@ pydantic==2.5.2
 pytest==7.4.3
 pytest-asyncio==0.23.2
 httpx==0.25.2
-
-# Optional: For LaMa inpainting (uncomment if needed)
-# simple-lama-inpainting

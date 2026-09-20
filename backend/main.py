@@ -1,20 +1,26 @@
 """
-Image Tampering Detection & Restoration System
-Backend API - FastAPI
+ImageGuard Backend API
+=======================
+FastAPI backend for image tampering detection and restoration.
 
-This is the production backend that wraps the AI pipeline.
-Run with: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+Integrates:
+- TruFor/MVSS-Net localization models
+- Pixel-level post-processing pipeline
+- Image restoration/inpainting
+- Forensic report generation
 """
 
 import os
+import sys
 import uuid
-import sqlite3
-import json
 import time
+import json
 import logging
+import sqlite3
+import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,8 +28,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -39,24 +51,28 @@ RESULT_DIR.mkdir(exist_ok=True)
 
 # Initialize FastAPI
 app = FastAPI(
-    title="Image Tampering Detection & Restoration API",
-    description="AI-powered forensic analysis for detecting and localizing image manipulations",
-    version="1.0.0",
+    title="ImageGuard - Image Tampering Detection & Restoration",
+    description="AI-powered forensic analysis using TruFor for pixel-level forgery localization",
+    version="2.0.0",
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static files
-app.mount("/static", StaticFiles(directory="results"), name="static")
+# Static files for results
+app.mount("/static/results", StaticFiles(directory="results"), name="results")
 
-# Database initialization
+# Global state
+localizer = None
+restorer = None
+
+
 def init_db():
     """Initialize SQLite database."""
     conn = sqlite3.connect(DB_PATH)
@@ -67,17 +83,12 @@ def init_db():
             filename TEXT NOT NULL,
             original_path TEXT NOT NULL,
             timestamp TEXT NOT NULL,
-            is_tampered INTEGER NOT NULL,
-            confidence REAL NOT NULL,
-            tampered_percentage REAL NOT NULL,
-            heatmap_path TEXT,
-            mask_path TEXT,
-            overlay_path TEXT,
-            ela_path TEXT,
-            restored_path TEXT,
-            model_info TEXT,
-            forensic_signals TEXT,
-            metrics TEXT,
+            verdict TEXT,
+            confidence REAL,
+            tampered_percentage REAL,
+            num_regions INTEGER,
+            model_used TEXT,
+            result_json TEXT,
             processing_time REAL,
             status TEXT DEFAULT 'pending'
         )
@@ -85,44 +96,42 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
 
-# Model loading (loaded once at startup)
-model_instance = None
+def load_models():
+    """Load AI models at startup."""
+    global localizer, restorer
+    
+    # Initialize localizer
+    from forensics.localization import ForensicLocalizer
+    localizer = ForensicLocalizer(device="auto")
+    localizer.initialize()
+    
+    # Initialize restorer
+    from restoration.inpainting import ImageRestorer
+    restorer = ImageRestorer(device="auto")
+    
+    logger.info("Models initialized")
 
-def load_model():
-    """Load the AI model once at startup."""
-    global model_instance
-    try:
-        from ai.inference.pipeline import ForensicPipeline
-        model_instance = ForensicPipeline()
-        model_instance.load_models()
-        logger.info("AI models loaded successfully")
-    except ImportError:
-        logger.warning("AI pipeline not available - running in demo mode")
-        model_instance = None
-    except Exception as e:
-        logger.error(f"Failed to load AI models: {e}")
-        model_instance = None
 
 @app.on_event("startup")
 async def startup_event():
-    load_model()
+    init_db()
+    load_models()
+
 
 # Pydantic models
-class AnalysisResponse(BaseModel):
-    id: str
-    filename: str
-    timestamp: str
-    is_tampered: bool
-    confidence: float
-    tampered_percentage: float
-    status: str
-
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
+    model_name: str
     version: str
+
+
+class AnalysisResponse(BaseModel):
+    id: str
+    status: str
+    message: str
+
 
 # API Endpoints
 
@@ -131,9 +140,11 @@ async def health_check():
     """Health check endpoint."""
     return HealthResponse(
         status="healthy",
-        model_loaded=model_instance is not None,
-        version="1.0.0"
+        model_loaded=localizer is not None and localizer.is_available(),
+        model_name=localizer.get_model_name() if localizer else "Not loaded",
+        version="2.0.0"
     )
+
 
 @app.post("/api/analyze")
 async def analyze_image(
@@ -141,8 +152,17 @@ async def analyze_image(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Accept an image and perform forensic analysis.
-    Returns analysis ID for retrieving results.
+    Accept an image and perform complete forensic analysis.
+    
+    Pipeline:
+    1. Validate and save image
+    2. Preprocess
+    3. Run TruFor/MVSS-Net localization
+    4. Post-process (morphological cleanup, connected components)
+    5. Extract regions and bounding boxes
+    6. Generate visualizations (heatmap, mask, overlay, contours)
+    7. Restore/inpaint tampered regions
+    8. Generate forensic report
     """
     # Validate file
     if not file.filename:
@@ -151,11 +171,11 @@ async def analyze_image(
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
     
-    # Read file
+    # Read and validate file
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large. Maximum: 20MB")
@@ -169,12 +189,11 @@ async def analyze_image(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid or corrupt image file")
     
-    # Generate safe filename
+    # Generate analysis ID and save file
     analysis_id = str(uuid.uuid4())
     safe_filename = f"{analysis_id}{ext}"
     file_path = UPLOAD_DIR / safe_filename
     
-    # Save file
     with open(file_path, "wb") as f:
         f.write(contents)
     
@@ -182,165 +201,285 @@ async def analyze_image(
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO analyses (id, filename, original_path, timestamp, is_tampered, 
-                            confidence, tampered_percentage, status)
-        VALUES (?, ?, ?, ?, 0, 0.0, 0.0, 'processing')
+        INSERT INTO analyses (id, filename, original_path, timestamp, status)
+        VALUES (?, ?, ?, ?, 'processing')
     """, (analysis_id, file.filename, str(file_path), datetime.now().isoformat()))
     conn.commit()
     conn.close()
     
     # Process in background
     if background_tasks:
-        background_tasks.add_task(process_analysis, analysis_id, str(file_path))
+        background_tasks.add_task(process_full_analysis, analysis_id, str(file_path))
     else:
-        # Synchronous processing (for testing)
-        process_analysis(analysis_id, str(file_path))
+        # Synchronous processing
+        process_full_analysis(analysis_id, str(file_path))
     
-    return {"id": analysis_id, "status": "processing"}
+    return {"id": analysis_id, "status": "processing", "message": "Analysis started"}
 
-def process_analysis(analysis_id: str, file_path: str):
-    """Process a single analysis."""
+
+def process_full_analysis(analysis_id: str, file_path: str):
+    """
+    Complete forensic analysis pipeline.
+    
+    This is the core pipeline that:
+    1. Runs localization model
+    2. Post-processes the localization map
+    3. Extracts regions from the actual pixel mask
+    4. Generates all visualizations
+    5. Performs restoration
+    6. Saves results
+    """
     start_time = time.time()
     
     try:
-        if model_instance is None:
-            # Demo mode - generate placeholder results
-            result = generate_demo_result(file_path)
-        else:
-            # Real AI pipeline
-            result = model_instance.analyze(file_path)
+        from PIL import Image
+        from forensics.preprocessing import preprocess_image, compute_ela
+        from forensics.postprocessing import (
+            postprocess_localization,
+            generate_heatmap,
+            generate_overlay,
+            generate_contour_overlay,
+        )
+        from forensics.regions import (
+            extract_regions,
+            compute_overall_verdict,
+            format_bounding_boxes_for_visualization,
+        )
+        from report.generator import generate_forensic_report
         
-        processing_time = time.time() - start_time
-        
-        # Save results
+        # Create result directory
         result_dir = RESULT_DIR / analysis_id
         result_dir.mkdir(exist_ok=True)
         
-        # Save result images
-        for key in ['heatmap', 'mask', 'overlay', 'ela', 'restored']:
-            if key in result and result[key] is not None:
-                img_path = result_dir / f"{key}.png"
-                result[key].save(str(img_path))
-                result[f"{key}_path"] = str(img_path)
+        # Step 1: Preprocess
+        logger.info(f"[{analysis_id}] Step 1: Preprocessing")
+        prep = preprocess_image(file_path)
+        original = prep['original']
+        original_array = prep['original_array']
+        original_size = prep['original_size']
+        
+        # Step 2: ELA Analysis
+        logger.info(f"[{analysis_id}] Step 2: Error Level Analysis")
+        ela_result = compute_ela(original)
+        ela_result['ela_image'].save(str(result_dir / 'ela.png'))
+        
+        # Step 3: Run localization model
+        logger.info(f"[{analysis_id}] Step 3: Running localization model")
+        loc_result = localizer.localize(file_path)
+        localization_map = loc_result['localization_map']
+        confidence_map = loc_result['confidence_map']
+        score = loc_result['score']
+        model_name = loc_result['model_name']
+        
+        # Save localization map as image
+        loc_map_img = Image.fromarray((localization_map * 255).astype(np.uint8))
+        loc_map_img.save(str(result_dir / 'localization_map.png'))
+        
+        # Save confidence map
+        conf_map_img = Image.fromarray((confidence_map * 255).astype(np.uint8))
+        conf_map_img.save(str(result_dir / 'confidence_map.png'))
+        
+        # Step 4: Post-process localization map
+        logger.info(f"[{analysis_id}] Step 4: Post-processing localization")
+        post_result = postprocess_localization(
+            localization_map=localization_map,
+            confidence_map=confidence_map,
+            original_size=original_size,
+            min_region_area=100,
+            confidence_threshold=0.4,
+            probability_threshold=0.5,
+        )
+        
+        binary_mask = post_result['binary_mask']
+        refined_mask = post_result['refined_mask']
+        components = post_result['components']
+        num_regions = post_result['num_regions']
+        tampered_percentage = post_result['tampered_percentage']
+        
+        # Save masks
+        Image.fromarray(binary_mask).save(str(result_dir / 'binary_mask.png'))
+        Image.fromarray(refined_mask).save(str(result_dir / 'refined_mask.png'))
+        
+        # Step 5: Extract regions with bounding boxes
+        logger.info(f"[{analysis_id}] Step 5: Extracting regions")
+        regions = extract_regions(
+            components=components,
+            localization_map=localization_map,
+            confidence_map=confidence_map,
+            original_size=original_size,
+        )
+        
+        # Step 6: Compute verdict
+        logger.info(f"[{analysis_id}] Step 6: Computing verdict")
+        verdict = compute_overall_verdict(
+            regions=regions,
+            score=score,
+            tampered_percentage=tampered_percentage,
+            model_name=model_name,
+        )
+        
+        # Step 7: Generate visualizations
+        logger.info(f"[{analysis_id}] Step 7: Generating visualizations")
+        
+        # Heatmap
+        heatmap_array = generate_heatmap(localization_map, original_size)
+        Image.fromarray(heatmap_array, 'RGBA').save(str(result_dir / 'heatmap.png'))
+        
+        # Overlay (mask on original)
+        overlay_array = generate_overlay(original_array, refined_mask)
+        Image.fromarray(overlay_array).save(str(result_dir / 'overlay.png'))
+        
+        # Contour overlay
+        contour_array = generate_contour_overlay(original_array, refined_mask)
+        Image.fromarray(contour_array).save(str(result_dir / 'contours.png'))
+        
+        # Step 8: Restoration
+        logger.info(f"[{analysis_id}] Step 8: Restoring tampered regions")
+        restored = restorer.restore(original, refined_mask)
+        restored.save(str(result_dir / 'restored.png'))
+        
+        # Step 9: Format bounding boxes for frontend
+        bounding_boxes = format_bounding_boxes_for_visualization(regions, original_size)
+        
+        # Step 10: Generate forensic signals
+        forensic_signals = _generate_forensic_signals(
+            ela_result, localization_map, confidence_map, regions, tampered_percentage
+        )
+        
+        processing_time = time.time() - start_time
+        
+        # Compile complete result
+        complete_result = {
+            'id': analysis_id,
+            'filename': Path(file_path).name,
+            'timestamp': datetime.now().isoformat(),
+            'image_size': f"{original_size[0]}x{original_size[1]}",
+            'processing_time': processing_time,
+            'verdict': verdict,
+            'regions': regions,
+            'bounding_boxes': bounding_boxes,
+            'forensic_signals': forensic_signals,
+            'ela_stats': {
+                'mean': ela_result['ela_mean'],
+                'max': ela_result['ela_max'],
+                'block_anomaly_score': ela_result['block_anomaly_score'],
+            },
+            'outputs': {
+                'original': f'/static/results/{analysis_id}/original.png',
+                'localization_map': f'/static/results/{analysis_id}/localization_map.png',
+                'confidence_map': f'/static/results/{analysis_id}/confidence_map.png',
+                'binary_mask': f'/static/results/{analysis_id}/binary_mask.png',
+                'refined_mask': f'/static/results/{analysis_id}/refined_mask.png',
+                'heatmap': f'/static/results/{analysis_id}/heatmap.png',
+                'overlay': f'/static/results/{analysis_id}/overlay.png',
+                'contours': f'/static/results/{analysis_id}/contours.png',
+                'ela': f'/static/results/{analysis_id}/ela.png',
+                'restored': f'/static/results/{analysis_id}/restored.png',
+            }
+        }
+        
+        # Save original to results
+        original.save(str(result_dir / 'original.png'))
+        
+        # Generate and save report
+        report_text = generate_forensic_report(complete_result)
+        with open(result_dir / 'report.txt', 'w') as f:
+            f.write(report_text)
+        
+        # Save JSON result
+        with open(result_dir / 'result.json', 'w') as f:
+            json.dump(complete_result, f, indent=2, default=str)
         
         # Update database
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE analyses SET 
-                is_tampered = ?,
+                verdict = ?,
                 confidence = ?,
                 tampered_percentage = ?,
-                heatmap_path = ?,
-                mask_path = ?,
-                overlay_path = ?,
-                ela_path = ?,
-                restored_path = ?,
-                model_info = ?,
-                forensic_signals = ?,
-                metrics = ?,
+                num_regions = ?,
+                model_used = ?,
+                result_json = ?,
                 processing_time = ?,
                 status = 'complete'
             WHERE id = ?
         """, (
-            1 if result['is_tampered'] else 0,
-            result['confidence'],
-            result['tampered_percentage'],
-            result.get('heatmap_path'),
-            result.get('mask_path'),
-            result.get('overlay_path'),
-            result.get('ela_path'),
-            result.get('restored_path'),
-            json.dumps(result.get('model_info', {})),
-            json.dumps(result.get('forensic_signals', [])),
-            json.dumps(result.get('metrics', {})),
+            verdict['verdict'],
+            verdict['overall_confidence'],
+            tampered_percentage,
+            num_regions,
+            model_name,
+            json.dumps(complete_result, default=str),
             processing_time,
             analysis_id
         ))
         conn.commit()
         conn.close()
         
-        logger.info(f"Analysis {analysis_id} completed in {processing_time:.2f}s")
+        logger.info(
+            f"[{analysis_id}] Analysis complete in {processing_time:.2f}s. "
+            f"Verdict: {verdict['verdict']}, Regions: {num_regions}"
+        )
         
     except Exception as e:
-        logger.error(f"Analysis {analysis_id} failed: {e}")
+        logger.error(f"[{analysis_id}] Analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("UPDATE analyses SET status = 'error' WHERE id = ?", (analysis_id,))
         conn.commit()
         conn.close()
 
-def generate_demo_result(file_path: str) -> dict:
-    """Generate demo results when AI model is not available."""
-    from PIL import Image
-    import numpy as np
+
+def _generate_forensic_signals(ela_result, localization_map, confidence_map, regions, tampered_pct):
+    """Generate forensic signal descriptions."""
+    signals = []
     
-    img = Image.open(file_path)
-    img_array = np.array(img)
-    h, w = img_array.shape[:2]
+    # ELA signal
+    if ela_result['block_anomaly_score'] > 0.5:
+        signals.append({
+            'name': 'ELA Compression Anomaly',
+            'description': 'Error Level Analysis shows inconsistent compression patterns.',
+            'severity': 'high' if ela_result['block_anomaly_score'] > 1.0 else 'medium',
+            'evidence': f'Block anomaly score: {ela_result["block_anomaly_score"]:.3f}'
+        })
     
-    # Generate simple heatmap
-    heatmap = np.zeros((h, w, 4), dtype=np.uint8)
-    cx, cy = w // 3, h // 3
-    Y, X = np.ogrid[:h, :w]
-    dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    radius = min(h, w) // 5
-    mask_region = dist < radius
-    heatmap[mask_region, 0] = 255
-    heatmap[mask_region, 3] = 180
-    heatmap_img = Image.fromarray(heatmap, 'RGBA')
+    # Localization signal
+    high_conf_pixels = np.sum(localization_map > 0.7)
+    total_pixels = localization_map.size
+    high_conf_ratio = high_conf_pixels / total_pixels
     
-    # Generate mask
-    mask = np.zeros((h, w, 4), dtype=np.uint8)
-    mask[mask_region, 0] = 255
-    mask[mask_region, 3] = 200
-    mask_img = Image.fromarray(mask, 'RGBA')
+    if high_conf_ratio > 0.01:
+        signals.append({
+            'name': 'Localization Confidence',
+            'description': f'{high_conf_ratio*100:.1f}% of pixels have high manipulation probability.',
+            'severity': 'high' if high_conf_ratio > 0.05 else 'medium',
+            'evidence': f'High-confidence area: {high_conf_ratio*100:.2f}%'
+        })
     
-    # Generate ELA (simple difference)
-    ela = np.abs(img_array.astype(np.int16) - (img_array * 0.95).astype(np.int16))
-    ela = (ela * 10).clip(0, 255).astype(np.uint8)
-    ela_img = Image.fromarray(ela)
+    # Region-based signals
+    critical_regions = [r for r in regions if r['severity'] == 'critical']
+    if critical_regions:
+        signals.append({
+            'name': 'Critical Manipulation Regions',
+            'description': f'{len(critical_regions)} region(s) with critical manipulation confidence.',
+            'severity': 'critical',
+            'evidence': f'Max region confidence: {max(r["region_confidence"] for r in critical_regions):.1%}'
+        })
     
-    # Generate overlay
-    overlay = img_array.copy()
-    overlay[mask_region] = (overlay[mask_region] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
-    overlay_img = Image.fromarray(overlay)
+    if not signals:
+        signals.append({
+            'name': 'No Significant Anomalies',
+            'description': 'Forensic analysis did not detect strong indicators of manipulation.',
+            'severity': 'low',
+            'evidence': 'All forensic signals within normal range'
+        })
     
-    # Generate restored (simple blur in masked region)
-    from PIL import ImageFilter
-    restored = img.copy()
-    blurred = img.filter(ImageFilter.GaussianBlur(radius=5))
-    restored_arr = np.array(restored)
-    blurred_arr = np.array(blurred)
-    restored_arr[mask_region] = blurred_arr[mask_region]
-    restored_img = Image.fromarray(restored_arr)
-    
-    tampered_pixels = np.sum(mask_region)
-    total_pixels = h * w
-    
-    return {
-        'is_tampered': True,
-        'confidence': 0.72,
-        'tampered_percentage': (tampered_pixels / total_pixels) * 100,
-        'heatmap': heatmap_img,
-        'mask': mask_img,
-        'overlay': overlay_img,
-        'ela': ela_img,
-        'restored': restored_img,
-        'model_info': {
-            'model': 'Demo Mode (AI model not loaded)',
-            'note': 'Install AI dependencies for real analysis'
-        },
-        'forensic_signals': [
-            {
-                'name': 'Demo Mode Active',
-                'description': 'AI model not loaded. Results are placeholder.',
-                'severity': 'medium',
-                'evidence': 'Install torch, opencv-python, and model weights for real analysis'
-            }
-        ],
-        'metrics': {}
-    }
+    return signals
+
 
 @app.get("/api/history")
 async def get_history():
@@ -348,7 +487,8 @@ async def get_history():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, filename, timestamp, is_tampered, confidence, tampered_percentage, status
+        SELECT id, filename, timestamp, verdict, confidence, tampered_percentage, 
+               num_regions, model_used, status
         FROM analyses ORDER BY timestamp DESC LIMIT 50
     """)
     rows = cursor.fetchall()
@@ -359,115 +499,60 @@ async def get_history():
             "id": row[0],
             "filename": row[1],
             "timestamp": row[2],
-            "is_tampered": bool(row[3]),
+            "verdict": row[3],
             "confidence": row[4],
             "tampered_percentage": row[5],
-            "status": row[6]
+            "num_regions": row[6],
+            "model_used": row[7],
+            "status": row[8],
         }
         for row in rows
     ]
 
-@app.get("/api/history/{analysis_id}")
-async def get_analysis(analysis_id: str):
-    """Get detailed analysis result."""
+
+@app.get("/api/results/{analysis_id}")
+async def get_results(analysis_id: str):
+    """Get detailed analysis results."""
+    result_file = RESULT_DIR / analysis_id / 'result.json'
+    
+    if result_file.exists():
+        with open(result_file, 'r') as f:
+            return json.load(f)
+    
+    # Try database
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,))
+    cursor.execute("SELECT result_json, status FROM analyses WHERE id = ?", (analysis_id,))
     row = cursor.fetchone()
     conn.close()
     
-    if not row:
-        raise HTTPException(status_code=404, detail="Analysis not found")
+    if row and row[0]:
+        return json.loads(row[0])
+    elif row:
+        return {"id": analysis_id, "status": row[1]}
     
-    columns = [desc[0] for desc in cursor.description]
-    result = dict(zip(columns, row))
-    
-    # Convert types
-    result['is_tampered'] = bool(result['is_tampered'])
-    result['model_info'] = json.loads(result['model_info']) if result['model_info'] else {}
-    result['forensic_signals'] = json.loads(result['forensic_signals']) if result['forensic_signals'] else []
-    result['metrics'] = json.loads(result['metrics']) if result['metrics'] else {}
-    
-    return result
+    raise HTTPException(status_code=404, detail="Analysis not found")
+
 
 @app.get("/api/download/{analysis_id}/{file_type}")
 async def download_file(analysis_id: str, file_type: str):
     """Download a result file."""
-    allowed_types = {'heatmap', 'mask', 'overlay', 'ela', 'restored', 'original'}
-    if file_type not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}")
+    allowed_types = {
+        'original', 'localization_map', 'confidence_map', 'binary_mask',
+        'refined_mask', 'heatmap', 'overlay', 'contours', 'ela', 'restored', 'report'
+    }
     
-    if file_type == 'original':
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT original_path FROM analyses WHERE id = ?", (analysis_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return FileResponse(row[0], filename=f"original_{analysis_id}")
-    else:
-        file_path = RESULT_DIR / analysis_id / f"{file_type}.png"
-        if file_path.exists():
-            return FileResponse(str(file_path), filename=f"{file_type}_{analysis_id}.png")
+    if file_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Invalid type. Allowed: {', '.join(allowed_types)}")
+    
+    ext = '.txt' if file_type == 'report' else '.png'
+    file_path = RESULT_DIR / analysis_id / f"{file_type}{ext}"
+    
+    if file_path.exists():
+        return FileResponse(str(file_path), filename=f"{file_type}_{analysis_id}{ext}")
     
     raise HTTPException(status_code=404, detail="File not found")
 
-@app.get("/api/report/{analysis_id}")
-async def generate_report(analysis_id: str):
-    """Generate a forensic report."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Analysis not found")
-    
-    columns = [desc[0] for desc in cursor.description]
-    result = dict(zip(columns, row))
-    
-    report = f"""
-FORENSIC ANALYSIS REPORT
-========================
-
-Analysis ID: {result['id']}
-Timestamp: {result['timestamp']}
-Filename: {result['filename']}
-Status: {result['status']}
-
-DETECTION RESULT
-----------------
-Verdict: {'TAMPERED' if result['is_tampered'] else 'AUTHENTIC'}
-Confidence: {result['confidence']:.1%}
-Tampered Region: {result['tampered_percentage']:.2f}%
-
-MODEL INFORMATION
------------------
-{json.dumps(json.loads(result['model_info']) if result['model_info'] else {}, indent=2)}
-
-FORENSIC SIGNALS
-----------------
-{json.dumps(json.loads(result['forensic_signals']) if result['forensic_signals'] else [], indent=2)}
-
-PROCESSING TIME
----------------
-{result['processing_time']:.2f} seconds
-
-LIMITATIONS
------------
-1. This analysis provides forensic evidence, not absolute proof.
-2. The restoration is a reconstruction, not recovery of original pixels.
-3. Sophisticated forgeries may evade detection.
-4. Results should be combined with other investigation methods.
-"""
-    
-    report_path = RESULT_DIR / analysis_id / "report.txt"
-    report_path.parent.mkdir(exist_ok=True)
-    with open(report_path, 'w') as f:
-        f.write(report)
-    
-    return FileResponse(str(report_path), filename=f"forensic_report_{analysis_id}.txt")
 
 if __name__ == "__main__":
     import uvicorn
