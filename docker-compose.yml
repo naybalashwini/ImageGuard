@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  # CPU-only configuration
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./ai/models/weights:/app/ai/models/weights
+      - ./datasets:/app/datasets
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DEVICE=cpu
+    restart: unless-stopped
+
+  # GPU configuration (uncomment to use)
+  # app-gpu:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.gpu
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./uploads:/app/uploads
+  #     - ./results:/app/results
+  #     - ./ai/models/weights:/app/ai/models/weights
+  #     - ./datasets:/app/datasets
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - DEVICE=cuda
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   restart: unless-stopped
