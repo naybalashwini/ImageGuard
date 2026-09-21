@@ -1,43 +1,5 @@
 ```
-# Dependencies
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-.env
-.env.local
-.env.*
-
-# Build and distribution artifacts
-build/
-dist/
-*.egg-info/
-*.egg
-*.whl
-
-# Logs
-*.log
-
-# Editor/IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-
-# Coverage
-.coverage
-htmlcov/
-coverage/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# MyPy
-.mypy_cache/
+# Database files
+*.db
+forensic.db
 ```
