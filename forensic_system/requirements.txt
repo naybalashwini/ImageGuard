@@ -1,0 +1,30 @@
+# Image Tampering Detection and Forensic Restoration System
+# Requirements - Python 3.9+
+
+# Core Deep Learning Frameworks
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+diffusers>=0.20.0
+accelerate>=0.20.0
+
+# Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=9.5.0
+
+# HuggingFace Hub for model management
+huggingface_hub>=0.16.0
+
+# UI Framework
+streamlit>=1.25.0
+
+# Utilities
+tqdm>=4.65.0
+requests>=2.31.0
+
+# Optional: for better image format support
+imageio>=2.31.0
+
+# For hash computation (built-in hashlib, but ensuring Python version)
+# No additional package needed

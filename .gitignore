@@ -1,5 +1,5 @@
-node_modules/
-.next/
-dist/
-build/
-*.log
+```
+# Database files
+*.db
+forensic.db
+```
